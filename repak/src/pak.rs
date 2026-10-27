@@ -151,6 +151,12 @@ impl Index {
 fn decrypt(key: &super::Key, bytes: &mut [u8]) -> Result<(), super::Error> {
     if let super::Key::Some(key) = key {
         use aes::cipher::BlockDecrypt;
+        if !bytes.len().is_multiple_of(16) {
+            return Err(super::Error::Other(format!(
+                "encrypted block of {} bytes is not a multiple of 16",
+                bytes.len()
+            )));
+        }
         for chunk in bytes.chunks_mut(16) {
             key.decrypt_block(aes::Block::from_mut_slice(chunk))
         }
@@ -471,10 +477,8 @@ impl Pak {
             let encoded_entries = index.read_len(size)?;
 
             let non_encoded_entry_count = index.read_u32::<LE>()? as usize;
-            let mut non_encoded_entries = Vec::with_capacity(non_encoded_entry_count);
-            for _ in 0..non_encoded_entry_count {
-                non_encoded_entries.push(Entry::read(&mut index, version)?);
-            }
+            let non_encoded_entries =
+                index.read_array_len(non_encoded_entry_count, |r| Entry::read(r, version))?;
 
             let mut entries_by_path = BTreeMap::new();
             if let Some(fdi) = &full_directory_index {
@@ -491,7 +495,14 @@ impl Pak {
                             Entry::read_encoded(&mut encoded_entries, version)?
                         } else {
                             let index = (-*encoded_offset) as usize - 1;
-                            non_encoded_entries[index].clone()
+                            non_encoded_entries
+                                .get(index)
+                                .ok_or_else(|| {
+                                    super::Error::Other(format!(
+                                        "non-encoded entry {index} out of range"
+                                    ))
+                                })?
+                                .clone()
                         };
                         let path = format!(
                             "{}{}",

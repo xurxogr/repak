@@ -33,7 +33,12 @@ impl Block {
 
 fn align(offset: u64) -> u64 {
     // add alignment (aes block size: 16) then zero out alignment bits
-    (offset + 15) & !15
+    offset.saturating_add(15) & !15
+}
+
+/// Error for an entry whose block layout doesn't fit its own data.
+fn corrupt_blocks() -> super::Error {
+    super::Error::Other("entry compression blocks fall outside its data".to_owned())
 }
 
 fn compression_index_size(version: Version) -> CompressionIndexSize {
@@ -231,7 +236,9 @@ impl Entry {
         let blocks = if compression_block_count == 1 && !encrypted {
             Some(vec![Block {
                 start: offset_base,
-                end: offset_base + compressed,
+                end: offset_base
+                    .checked_add(compressed)
+                    .ok_or_else(corrupt_blocks)?,
             }])
         } else if compression_block_count > 0 {
             let mut index = offset_base;
@@ -241,12 +248,12 @@ impl Entry {
                         let mut block_size = reader.read_u32::<LE>()? as u64;
                         let block = Block {
                             start: index,
-                            end: index + block_size,
+                            end: index.checked_add(block_size).ok_or_else(corrupt_blocks)?,
                         };
                         if encrypted {
                             block_size = align(block_size);
                         }
-                        index += block_size;
+                        index = index.checked_add(block_size).ok_or_else(corrupt_blocks)?;
                         Ok(block)
                     })
                     .collect::<Result<Vec<_>, super::Error>>()?,
@@ -368,18 +375,27 @@ impl Entry {
 
         #[cfg(feature = "compression")]
         let ranges = {
-            let offset = |index: u64| -> usize {
-                (match version.version_major() >= VersionMajor::RelativeChunkOffsets {
-                    true => index - (data_offset - self.offset),
-                    false => index - data_offset,
-                }) as usize
+            // Block offsets come from the pak, so they are checked to land
+            // inside `data` rather than trusted to slice it.
+            let offset = |index: u64| -> Result<usize, super::Error> {
+                let base = match version.version_major() >= VersionMajor::RelativeChunkOffsets {
+                    true => data_offset.checked_sub(self.offset),
+                    false => Some(data_offset),
+                };
+                base.and_then(|base| index.checked_sub(base))
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .ok_or_else(corrupt_blocks)
             };
 
             match &self.blocks {
                 Some(blocks) => blocks
                     .iter()
-                    .map(|block| offset(block.start)..offset(block.end))
-                    .collect::<Vec<_>>(),
+                    .map(|block| {
+                        let range = offset(block.start)?..offset(block.end)?;
+                        data.get(range.clone()).ok_or_else(corrupt_blocks)?;
+                        Ok(range)
+                    })
+                    .collect::<Result<Vec<_>, super::Error>>()?,
                 #[allow(clippy::single_range_in_vec_init)]
                 None => vec![0..data.len()],
             }
@@ -394,7 +410,13 @@ impl Entry {
             };
         }
 
-        match self.compression_slot.and_then(|c| compression[c as usize]) {
+        let slot = match self.compression_slot {
+            None => None,
+            Some(c) => *compression
+                .get(c as usize)
+                .ok_or_else(|| super::Error::Other(format!("compression slot {c} out of range")))?,
+        };
+        match slot {
             None => buf.write_all(&data)?,
             #[cfg(not(feature = "compression"))]
             _ => return Err(super::Error::Compression),
@@ -415,14 +437,28 @@ impl Entry {
                         }
                     }
                     Compression::LZ4 => {
-                        let mut decompressed = vec![0; self.uncompressed as usize];
-                        for (decomp_chunk, comp_range) in
-                            decompressed.chunks_mut(chunk_size).zip(ranges)
-                        {
-                            lz4_flex::block::decompress_into(&data[comp_range], decomp_chunk)
+                        // One block at a time: `uncompressed` and the block
+                        // size come from the pak, so a buffer for the whole
+                        // entry would be sized by the file's own claim.
+                        let mut remaining = self.uncompressed;
+                        let mut chunk = Vec::new();
+                        for comp_range in ranges {
+                            if remaining == 0 {
+                                break;
+                            }
+                            let comp = &data[comp_range];
+                            let len = remaining.min(chunk_size as u64);
+                            // An LZ4 block can't expand more than ~255x, so a
+                            // larger claim is a corrupt header.
+                            if len > (comp.len() as u64).saturating_mul(255).saturating_add(16) {
+                                return Err(Error::DecompressionFailed(Compression::LZ4));
+                            }
+                            chunk.resize(len as usize, 0);
+                            lz4_flex::block::decompress_into(comp, &mut chunk)
                                 .map_err(|_| Error::DecompressionFailed(Compression::LZ4))?;
+                            buf.write_all(&chunk)?;
+                            remaining -= len;
                         }
-                        buf.write_all(&decompressed)?;
                     }
                     #[cfg(feature = "oodle")]
                     Compression::Oodle => {

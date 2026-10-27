@@ -1,4 +1,9 @@
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
+use std::io::Read;
+
+/// Upper bound on the capacity reserved up front for an array whose length
+/// was read from the file.
+const MAX_PREALLOC_ELEMENTS: usize = 4096;
 
 pub trait BoolExt<T, E, F: FnOnce() -> Result<T, E>> {
     fn then_try(&self, f: F) -> Result<Option<T>, E>;
@@ -59,8 +64,11 @@ impl<R: std::io::Read> ReadExt for R {
         len: usize,
         mut func: impl FnMut(&mut Self) -> Result<T, super::Error>,
     ) -> Result<Vec<T>, super::Error> {
-        let mut buf = Vec::with_capacity(len);
-        for _ in 0..buf.capacity() {
+        // `len` comes from the file, so it only bounds the loop: the buffer
+        // grows with the elements actually read and a bogus count fails at EOF
+        // instead of reserving memory up front.
+        let mut buf = Vec::with_capacity(len.min(MAX_PREALLOC_ELEMENTS));
+        for _ in 0..len {
             buf.push(func(self)?);
         }
         Ok(buf)
@@ -69,20 +77,26 @@ impl<R: std::io::Read> ReadExt for R {
     fn read_string(&mut self) -> Result<String, super::Error> {
         let len = self.read_i32::<LE>()?;
         if len < 0 {
-            let chars = self.read_array_len((-len) as usize, |r| Ok(r.read_u16::<LE>()?))?;
+            let chars =
+                self.read_array_len(len.unsigned_abs() as usize, |r| Ok(r.read_u16::<LE>()?))?;
             let length = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
-            Ok(String::from_utf16(&chars[..length]).unwrap())
+            Ok(String::from_utf16(&chars[..length])?)
         } else {
-            let mut chars = vec![0; len as usize];
-            self.read_exact(&mut chars)?;
+            let chars = self.read_len(len as usize)?;
             let length = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
             Ok(String::from_utf8_lossy(&chars[..length]).into_owned())
         }
     }
 
     fn read_len(&mut self, len: usize) -> Result<Vec<u8>, super::Error> {
-        let mut buf = vec![0; len];
-        self.read_exact(&mut buf)?;
+        // Read through `take` rather than into `vec![0; len]`: `len` comes
+        // from the file, and the buffer then only grows with the bytes that
+        // are really there.
+        let mut buf = Vec::new();
+        self.by_ref().take(len as u64).read_to_end(&mut buf)?;
+        if buf.len() != len {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
         Ok(buf)
     }
 }
@@ -109,5 +123,39 @@ impl<W: std::io::Write> WriteExt for W {
             self.write_u16::<LE>(0)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReadExt;
+    use std::io::Cursor;
+
+    #[test]
+    fn read_len_fails_on_a_length_past_the_data() {
+        let mut reader = Cursor::new(vec![1, 2, 3]);
+        assert!(reader.read_len(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn read_array_len_fails_on_a_count_past_the_data() {
+        let mut reader = Cursor::new(vec![0; 8]);
+        assert!(reader
+            .read_array_len(usize::MAX, |r| Ok(r.read_len(1)?[0]))
+            .is_err());
+    }
+
+    #[test]
+    fn read_string_rejects_unpaired_utf16_surrogates() {
+        let mut data = (-2i32).to_le_bytes().to_vec();
+        data.extend_from_slice(&0xD800u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        assert!(Cursor::new(data).read_string().is_err());
+    }
+
+    #[test]
+    fn read_string_fails_on_a_min_length() {
+        let data = i32::MIN.to_le_bytes().to_vec();
+        assert!(Cursor::new(data).read_string().is_err());
     }
 }
