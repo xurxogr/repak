@@ -347,7 +347,13 @@ mod roundtrip {
                 "mismatched content for {} with version {:?} compression {:?}",
                 path, version, compression,
             );
+            let size = pak_reader.entry_size(path).unwrap();
+            assert_eq!(size.uncompressed, expected_data.len() as u64);
+            if compression.is_none() {
+                assert_eq!(size.stored, expected_data.len() as u64);
+            }
         }
+        assert_eq!(pak_reader.entry_size("missing.txt"), None);
     }
 
     macro_rules! roundtrip_tests {

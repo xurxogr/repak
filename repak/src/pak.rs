@@ -73,6 +73,16 @@ impl PakBuilder {
     }
 }
 
+/// The sizes an entry records for its data, see [`PakReader::entry_size`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntrySize {
+    /// Bytes [`PakReader::read_file`] reads from the pak and holds in memory
+    /// at once: the compressed size, padded to the AES block when encrypted.
+    pub stored: u64,
+    /// Bytes the entry extracts to.
+    pub uncompressed: u64,
+}
+
 #[derive(Debug)]
 pub struct PakReader {
     pak: Pak,
@@ -233,6 +243,18 @@ impl PakReader {
             ),
             None => Err(super::Error::MissingEntry(path.to_owned())),
         }
+    }
+
+    /// The sizes `path`'s entry records for its data, or `None` if there is
+    /// no such entry. They come from the pak itself, so a caller extracting
+    /// from an untrusted pak can refuse an entry before [`Self::read_file`]
+    /// reads its stored bytes into memory.
+    pub fn entry_size(&self, path: &str) -> Option<EntrySize> {
+        let entry = self.pak.index.entries().get(path)?;
+        Some(EntrySize {
+            stored: entry.stored_len(),
+            uncompressed: entry.uncompressed,
+        })
     }
 
     pub fn files(&self) -> Vec<String> {

@@ -70,6 +70,14 @@ impl Entry {
     pub fn is_encrypted(&self) -> bool {
         0 != (self.flags & 1)
     }
+    /// Bytes [`Self::read_file`] reads from the pak: the compressed size,
+    /// padded to the AES block when encrypted.
+    pub fn stored_len(&self) -> u64 {
+        match self.is_encrypted() {
+            true => align(self.compressed),
+            false => self.compressed,
+        }
+    }
     pub fn is_deleted(&self) -> bool {
         0 != (self.flags >> 1) & 1
     }
@@ -353,10 +361,7 @@ impl Entry {
         #[cfg(any(feature = "compression", feature = "oodle"))]
         let data_offset = reader.stream_position()?;
         #[allow(unused_mut)]
-        let mut data = reader.read_len(match self.is_encrypted() {
-            true => align(self.compressed),
-            false => self.compressed,
-        } as usize)?;
+        let mut data = reader.read_len(self.stored_len() as usize)?;
         if self.is_encrypted() {
             #[cfg(not(feature = "encryption"))]
             return Err(super::Error::Encryption);
